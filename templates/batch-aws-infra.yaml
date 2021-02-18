@@ -315,7 +315,8 @@ Resources:
         Vcpus: 4
         Memory: 16000
         Command:
-          - echo helloworld
+          - echo
+          - helloworld
         # Environment:
         #   - Name: env
         #     Value: value
