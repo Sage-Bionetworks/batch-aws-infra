@@ -1,9 +1,9 @@
 AWSTemplateFormatVersion: 2010-09-09
 Description: Batch jobs for specified docker container
 Parameters:
-  BatchAmi:
-    Description: The compute resource AWS AMI
-    Type: 'AWS::EC2::Image::Id'
+  # BatchAmi:
+  #   Description: The compute resource AWS AMI
+  #   Type: 'AWS::EC2::Image::Id'
   MainImage:
     Description: The docker image to use to run commands
     Type: String
