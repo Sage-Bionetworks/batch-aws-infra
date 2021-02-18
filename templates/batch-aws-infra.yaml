@@ -1,0 +1,329 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Batch jobs for Genie validation.
+
+Parameters:
+  ComputeImageId:
+    Description: The Genie compute resource image ID
+    Type: 'AWS::EC2::Image::Id'
+  MainImage:
+    Description: The Genie main processing and validation docker container image
+    Type: String
+  Department:
+    Description: 'The department for this resource'
+    Type: String
+    AllowedPattern: '^\S*$'
+    ConstraintDescription: 'Must be string with no spaces'
+  Project:
+    Description: 'The name of the project that this resource is used for'
+    Type: String
+    AllowedPattern: '^\S*$'
+    ConstraintDescription: 'Must be string with no spaces'
+  OwnerEmail:
+    Description: 'Email address of the owner of this resource'
+    Type: String
+    AllowedPattern: '^(([^<>()\[\]\\.,;:\s@"]+(\.[^<>()\[\]\\.,;:\s@"]+)*)|(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$'
+    ConstraintDescription: 'Must be an acceptable email address syntax(i.e. joe.smith@sagebase.org)'
+  ParkMyCloudManaged:
+    Description: Allow ParkMyCloud service to start/stop resources
+    Type: String
+    Default: 'yes'
+
+Resources:
+
+  KmsInfraKey:
+    Type: "AWS::KMS::Key"
+    Properties:
+      Description: !Join
+        - '-'
+        - - !Ref AWS::StackName
+          - "InfraKey"
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: "Allow administration of the key"
+            Effect: "Allow"
+            Principal:
+              AWS:
+                - !Join
+                  - ''
+                  - - 'arn:aws:iam::'
+                    - !Ref AWS::AccountId
+                    - ':root'
+                - !ImportValue us-east-1-bootstrap-CfServiceRoleArn
+                - !FindInMap [AdminRoleArns, !Ref "AWS::AccountId", Arn]
+            Action:
+              - "kms:Create*"
+              - "kms:Describe*"
+              - "kms:Enable*"
+              - "kms:List*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:ScheduleKeyDeletion"
+              - "kms:CancelKeyDeletion"
+            Resource: "*"
+          -
+            Sid: "Allow use of the key"
+            Effect: "Allow"
+            Principal:
+              AWS:
+                - !ImportValue us-east-1-bootstrap-CfServiceRoleArn
+                - !FindInMap [AdminRoleArns, !Ref "AWS::AccountId", Arn]
+                - !GetAtt CodeDeployEC2Role.Arn
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+      Tags:
+        - Key: "Department"
+          Value: !Ref Department
+        - Key: "Project"
+          Value: !Ref Project
+        - Key: "OwnerEmail"
+          Value: !Ref OwnerEmail
+
+  BatchInfraKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Join
+        - ''
+        - - 'alias/'
+          - !Ref AWS::StackName
+          - '/InfraKey'
+      TargetKeyId: !Ref KmsInfraKey
+
+  MyCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 365
+
+  PublishToCloudwatchPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+              - 'logs:DescribeLogGroups'
+            Resource: !GetAtt MyCloudWatchLogGroup.Arn
+      Roles:
+        - !Ref BatchInstanceRole
+
+  JobFailedAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref OwnerEmail
+
+  JobFailedEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Event rule for failed jobs."
+      EventPattern:
+        source:
+          - "aws.batch"
+        detail-type:
+          - "Batch Job State Change"
+        detail:
+          status:
+            - "FAILED"
+          jobQueue:
+            - !Ref BatchJobQueue
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !Ref JobFailedAlertTopic
+          Id: !Sub '${AWS::StackName}-FailedBatchJob-daily'
+
+  EventTopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: '*'
+      Topics:
+        - !Ref JobFailedAlertTopic
+
+  PermissionForEventsToInvokeBatch:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceEventTargetRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "ScheduledRule"
+      ScheduleExpression: "rate(1 day)"
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !Ref BatchJobQueue
+          Id: !Sub '${AWS::StackName}-job-validation'
+          RoleArn: !GetAtt PermissionForEventsToInvokeBatch.Arn
+          BatchParameters:
+            JobDefinition: !Ref ValidationBatchJob
+            JobName: !Sub '${AWS::StackName}-job-validation'
+
+  BatchServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+        - !Ref PublishToCloudwatchPolicy
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+
+  BatchInstanceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+          - Effect: Allow
+            Action:
+            - secretsmanager:GetSecretValue
+            - kms:Decrypt
+            Resource:
+            - arn:aws:secretsmanager:<region>:<aws_account_id>:secret:<secret_name>
+            - arn:aws:kms:<region>:<aws_account_id>:key/<key_id>
+      Path: "/"
+
+  BatchInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref BatchInstanceRole
+
+  BatchComputeEnvironment:
+    Type: "AWS::Batch::ComputeEnvironment"
+    Properties:
+      Type: MANAGED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      State: ENABLED
+      ComputeResources:
+        Type: EC2
+        MaxvCpus: 256
+        SecurityGroupIds:
+          - !ImportValue us-east-1-computevpc-VpnSecurityGroup
+        Subnets:
+          - !ImportValue us-east-1-computevpc-PrivateSubnet
+          - !ImportValue us-east-1-computevpc-PrivateSubnet1
+          - !ImportValue us-east-1-computevpc-PrivateSubnet2
+        MinvCpus: 0
+        # ImageId: !Ref ComputeImageId
+        InstanceRole: !GetAtt BatchInstanceProfile.Arn
+        InstanceTypes:
+          - optimal
+        DesiredvCpus: 8
+        Tags:
+          "parkmycloud": !Ref ParkMyCloudManaged
+          "Name": !Sub '${AWS::StackName}-BatchComputeEnvironment'
+          "Department": !Ref Department
+          "Project": !Ref Project
+          "OwnerEmail": !Ref OwnerEmail
+
+  BatchJobQueue:
+    Type: "AWS::Batch::JobQueue"
+    Properties:
+      JobQueueName: !Join
+        - '-'
+        - - !Ref AWS::StackName
+          - "job"
+          - "queue"
+      ComputeEnvironmentOrder:
+        - ComputeEnvironment: !Ref BatchComputeEnvironment
+          Order: 1
+      Priority: 1
+      State: ENABLED
+
+  BatchJob:
+    Type: 'AWS::Batch::JobDefinition'
+    Properties:
+      Type: container
+      JobDefinitionName: !Join
+        - '-'
+        - - !Ref AWS::StackName
+          - "batch"
+          - "job"
+      ContainerProperties:
+        Image: !Ref MainImage
+        Vcpus: 4
+        Memory: 16000
+        Command:
+          - echo helloworld
+        # Environment:
+        #   - Name: env
+        #     Value: value
+        # Volumes:
+        #   - Host:
+        #       SourcePath: "/path/in/ec2"
+        #     Name: volumename
+        # MountPoints:
+        #   - ContainerPath: "/path/in/container"
+        #     ReadOnly: true
+        #     SourceVolume: volumename
+        # secrets:
+        #   - name: PASSWORD
+        #     valueFrom: arn:aws:secretsmanager:region:aws_account_id:secret:secret_name-AbCdEf
+      Timeout:
+        AttemptDurationSeconds: 345600
+
+Outputs:
+  MyCloudWatchLogGroup:
+    Value: !Ref MyCloudWatchLogGroup
+    Export:
+      Name: !Sub '${AWS::Region}-${AWS::StackName}-CloudWatchLogGroup'
+  BatchComputeEnvironment:
+    Value: !Ref BatchComputeEnvironment
+    Export:
+      Name: !Sub '${AWS::Region}-${AWS::StackName}-BatchComputeEnvironment'
+  BatchJobQueue:
+    Value: !Ref BatchJobQueue
+    Export:
+      Name: !Sub '${AWS::Region}-${AWS::StackName}-BatchJobQueue'
+  BatchJob:
+    Value: !Ref BatchJob
+    Export:
+      Name: !Sub '${AWS::Region}-${AWS::StackName}-BatchJob'

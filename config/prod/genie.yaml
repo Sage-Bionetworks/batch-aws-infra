@@ -1,0 +1,11 @@
+template_path: batch-aws-infra.yaml
+stack_name: batch-aws-infra
+parameters:
+  # Distibution: Amazon Linux.
+  ImageId: ami-0a0966a44218e21ab
+
+  MainImage: ubuntu:latest
+
+  Department: "CompOnc"
+  Project: "testing"
+  OwnerEmail: "thomas.yu@sagebase.org"
